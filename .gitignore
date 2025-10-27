@@ -2,3 +2,5 @@
 __pychace__/
 
 .DS_Store
+__pycache__/main.cpython-311.pyc
+.DS_Store
