@@ -5,6 +5,16 @@ from fastapi import Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 import logging
+import pandas as pd
+
+# Try to import the optimizer function; fall back gracefully if not available
+pick_fpl_team = None
+try:
+    from optimisation_fpl import pick_fpl_team as _pick_fpl_team
+    pick_fpl_team = _pick_fpl_team
+    logging.getLogger(__name__).info("Optimizer function 'pick_fpl_team' imported from optimisation_fpl.py")
+except Exception as _imp_err:
+    logging.getLogger(__name__).warning(f"Optimizer import failed: {_imp_err}")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +62,82 @@ app.add_middleware(
     allow_headers=["*"], # Allows all headers
 )
 logger.info(f"CORS middleware configured for origins: {origins}")
+
+
+def get_data_for_optimizer() -> tuple[list[list[object]], pd.DataFrame]:
+    """
+    Build optimizer input from database tables.
+    Returns:
+      - optimizer_data: list of [player_id, name, position_str, team_id, cost_float, gw1, gw2, gw3, gw4]
+      - players_df: DataFrame with at least columns ['player_id','name','position','team_id','cost']
+    Notes:
+      - gw1 is the most recent expected_points, gw4 is older.
+      - cost is in millions (e.g., 5.5), not in tenths.
+    """
+    with engine.connect() as connection:
+        # Rank latest four gameweeks per player by gameweek desc
+        sql = text(
+            """
+            WITH ranked AS (
+                SELECT 
+                    player_id,
+                    COALESCE(expected_points, total_points::float, 0.0) AS ep,
+                    gameweek,
+                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY gameweek DESC) AS rn
+                FROM player_gameweek_history
+            )
+            SELECT 
+                p.id AS player_id,
+                p.web_name AS name,
+                p.first_name,
+                p.second_name,
+                p.team_id,
+                p.position,
+                p.now_cost,
+                COALESCE(MAX(CASE WHEN r.rn = 1 THEN r.ep END), 0.0) AS gw1,
+                COALESCE(MAX(CASE WHEN r.rn = 2 THEN r.ep END), 0.0) AS gw2,
+                COALESCE(MAX(CASE WHEN r.rn = 3 THEN r.ep END), 0.0) AS gw3,
+                COALESCE(MAX(CASE WHEN r.rn = 4 THEN r.ep END), 0.0) AS gw4
+            FROM players p
+            LEFT JOIN ranked r ON r.player_id = p.id
+            GROUP BY p.id, p.web_name, p.first_name, p.second_name, p.team_id, p.position, p.now_cost
+            ORDER BY p.id ASC
+            """
+        )
+        rows = connection.execute(sql).fetchall()
+
+    # Map positions to optimizer labels
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    data: list[list[object]] = []
+    records: list[dict[str, object]] = []
+    for r in rows:
+        m = dict(r._mapping)
+        position_str = pos_map.get(int(m["position"]) if m["position"] is not None else 0, "MID")
+        cost_float = float(m["now_cost"] or 0) / 10.0
+        row = [
+            int(m["player_id"]),
+            str(m["name"] or ""),
+            position_str,
+            int(m["team_id"]) if m["team_id"] is not None else 0,
+            cost_float,
+            float(m["gw1"] or 0.0),
+            float(m["gw2"] or 0.0),
+            float(m["gw3"] or 0.0),
+            float(m["gw4"] or 0.0),
+        ]
+        data.append(row)
+        records.append({
+            "player_id": int(m["player_id"]),
+            "name": str(m["name"] or ""),
+            "first_name": m.get("first_name"),
+            "second_name": m.get("second_name"),
+            "position": position_str,
+            "team_id": int(m["team_id"]) if m["team_id"] is not None else 0,
+            "cost": cost_float,
+        })
+
+    players_df = pd.DataFrame.from_records(records)
+    return data, players_df
 
 
 @app.get("/")
@@ -498,3 +584,53 @@ def get_gameweeks_paged(
         logger.error(f"Error fetching paged gameweeks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
     
+
+@app.get("/api/v1/optimize-team")
+def get_optimized_team():
+    if pick_fpl_team is None:
+        raise HTTPException(status_code=500, detail="Optimizer function not imported. Check server logs.")
+        
+    try:
+        # 1. Get data formatted for the optimizer
+        optimizer_data, players_df = get_data_for_optimizer()
+        if not optimizer_data:
+            raise HTTPException(status_code=404, detail="No player data found to optimize.")
+
+        # 2. Run the optimizer function
+        # This will return just the IDs of the chosen players
+        squad_ids, xi_ids, captain_id = pick_fpl_team(optimizer_data)
+        
+        if not squad_ids:
+            raise HTTPException(status_code=500, detail="Optimizer failed to find a solution.")
+
+        # 3. Get the full player details for the frontend
+        # Convert players_df to a dict for easy lookup
+        players_dict = players_df.set_index('player_id').to_dict('index')
+        
+        optimal_squad = []
+        for pid in squad_ids:
+            player_data = players_dict.get(pid)
+            if player_data:
+                # Add back the fields the frontend expects
+                player_data['id'] = pid
+                player_data['now_cost'] = int(player_data['cost'] * 10)
+                # Map position string back to integer
+                pos_map = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4}
+                player_data['position'] = pos_map.get(player_data['position'])
+                # Ensure web_name exists for frontend display
+                if 'web_name' not in player_data or not player_data.get('web_name'):
+                    player_data['web_name'] = player_data.get('name', '')
+                # Include first_name/second_name so UI can render full name
+                player_data['first_name'] = player_data.get('first_name')
+                player_data['second_name'] = player_data.get('second_name')
+                optimal_squad.append(player_data)
+
+        return {
+            "squad": optimal_squad,
+            "xi_ids": xi_ids,
+            "captain_id": captain_id
+        }
+
+    except Exception as e:
+        logging.error(f"Error in optimizer endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")

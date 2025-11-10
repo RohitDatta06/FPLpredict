@@ -1,35 +1,53 @@
 import axios from 'axios';
 
 // The base URL of your FastAPI backend
-// You'll run this locally first, so the default is usually:
-const API_URL = 'http://127.0.0.1:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
-// Define an interface for the Player data you expect
-// Updated to match all columns in the 'players' database table
+// This interface is correct and matches your 'players' table
 export interface Player {
   id: number;
-  first_name: string | null; // Use string | null if the DB column can be empty
-  second_name: string | null; // Use string | null if the DB column can be empty
+  first_name: string | null;
+  second_name: string | null;
   web_name: string;
   team_id: number;
   position: number;
   now_cost: number;
 }
 
+// --- NEW INTERFACE ---
+// This defines the object shape that the /optimize-team endpoint returns
+export interface OptimizedTeamResponse {
+  squad: Player[];      // The full 15-player squad
+  xi_ids: number[];     // The 11 IDs of the starting players
+  captain_id: number;   // The ID of the captain
+}
+
 // Function to fetch all players
 export const getPlayers = async (): Promise<Player[]> => {
   try {
-    // Make sure your backend returns data matching the Player interface
     const response = await axios.get<Player[]>(`${API_URL}/api/v1/players`);
     return response.data;
   } catch (error) {
-    console.error("Error fetching players:", error);
-    // It's often better to return an empty array or handle the error
-    // in the component rather than re-throwing here,
-    // but re-throwing works for now.
+    console.error(`Error fetching players from ${API_URL}/api/v1/players:`, error);
     throw error;
   }
 };
+
+// --- UPDATED FUNCTION ---
+// Function to fetch the optimized 15-player squad
+export const getOptimizedTeam = async (): Promise<OptimizedTeamResponse> => {
+  try {
+    // We update the expected type from Player[] to OptimizedTeamResponse
+    const response = await axios.get<OptimizedTeamResponse>(`${API_URL}/api/v1/optimize-team`);
+    return response.data;
+  } catch (error) {
+    console.error(`Error fetching optimized team from ${API_URL}/api/v1/optimize-team:`, error);
+    throw error;
+  }
+};
+
+
+// --- All other functions (getPlayersPaged, getTeams, etc.) remain below ---
 
 // Generic paginated result type
 export interface PagedResult<T> {
@@ -186,4 +204,3 @@ export const getGameweekHistoryPaged = async (
   );
   return response.data;
 };
-
