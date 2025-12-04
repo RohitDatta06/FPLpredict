@@ -1,5 +1,10 @@
 import React, { useState } from 'react';
-import { getOptimizedTeam, type Player, type OptimizedTeamResponse } from '../services/api';
+import {
+  getOptimizedTeam,
+  getOptimizedTeamExplanation,
+  type Player,
+  type OptimizedTeamResponse,
+} from '../services/api';
 
 // Helper function to group players by position
 const groupPlayersByPosition = (players: Player[]) => {
@@ -86,18 +91,21 @@ const Optimizer: React.FC = () => {
   // NEW: locked players input (no gameweek)
   const [lockedInput, setLockedInput] = useState<string>(''); // e.g. "Erling Haaland, Bukayo Saka"
 
+  // NEW: AI explanation state (must be inside component!)
+  const [explanation, setExplanation] = useState<string | null>(null);
+  const [explainLoading, setExplainLoading] = useState(false);
+
   const handleOptimizeClick = async () => {
     setLoading(true);
     setError(null);
     setTeamResponse(null);
+    setExplanation(null);
 
     try {
-      // Parse locked players: comma or newline separated
-      const lockedNames =
-        lockedInput
-          .split(/[\n,]/)
-          .map(s => s.trim())
-          .filter(s => s.length > 0);
+      const lockedNames = lockedInput
+        .split(/[\n,]/)
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
 
       const response = await getOptimizedTeam(lockedNames);
       setTeamResponse(response);
@@ -109,6 +117,31 @@ const Optimizer: React.FC = () => {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleExplainClick = async () => {
+    if (!teamResponse) return;
+
+    setExplainLoading(true);
+    setError(null);
+
+    try {
+      const lockedNames = lockedInput
+        .split(/[\n,]/)
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+
+      const { explanation } = await getOptimizedTeamExplanation(lockedNames);
+      setExplanation(explanation);
+    } catch (err: any) {
+      setError(
+        err?.response?.data?.detail ||
+          'Failed to generate explanation. Is the backend running and GEMINI_API_KEY set?',
+      );
+      console.error(err);
+    } finally {
+      setExplainLoading(false);
     }
   };
 
@@ -163,6 +196,18 @@ const Optimizer: React.FC = () => {
             'Generate Optimal Squad'
           )}
         </button>
+
+        {teamResponse && (
+          <button
+            onClick={handleExplainClick}
+            disabled={explainLoading}
+            className="mt-2 ml-0 sm:ml-4 px-6 py-2 bg-purple-600 text-white font-semibold rounded-lg shadow
+                      hover:bg-purple-500 transition-colors duration-200
+                      disabled:bg-gray-500 disabled:cursor-not-allowed"
+          >
+            {explainLoading ? 'Asking AI...' : 'Explain this squad with AI'}
+          </button>
+        )}
       </div>
 
       {/* --- Error --- */}
@@ -212,8 +257,18 @@ const Optimizer: React.FC = () => {
           </div>
         </div>
       )}
+
+      {explanation && (
+        <div className="mt-6 bg-[#2b2b2b] rounded-lg border border-[#4a4a4a] p-4">
+          <h3 className="text-xl font-semibold text-purple-300 mb-3">AI Explanation</h3>
+          <div className="prose prose-invert max-w-none text-gray-100 whitespace-pre-wrap">
+            {explanation}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
 
 export default Optimizer;
+

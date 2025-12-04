@@ -8,6 +8,9 @@ import logging
 import pandas as pd
 from typing import List, Optional
 from fastapi import Query, HTTPException
+import google.generativeai as genai
+import math
+
 
 # ========== NEW IMPORTS FOR INTEGRATION ==========
 from predictor import FPLPredictor
@@ -61,6 +64,13 @@ app = FastAPI(
     title="FPL Predictor API",
     description="API for fetching FPL data and predictions."
 )
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("✓ Gemini API configured.")
+else:
+    logger.warning("⚠ GEMINI_API_KEY not set. LLM explanation endpoint will be disabled.")
 
 # Allows your React frontend (running on localhost:5173) to talk to this backend
 origins = [
@@ -324,7 +334,7 @@ def get_fixtures_paged(
                 """
             )
             result = connection.execute(data_query, {"limit": limit, "offset": offset})
-            items = [dict(row._mapping) for r in result]
+            items = [dict(r._mapping) for r in result]
             return {"items": items, "total": total}
     except Exception as e:
         logger.error(f"Error fetching paged fixtures: {e}", exc_info=True)
@@ -551,6 +561,9 @@ def get_gameweeks_paged(
         logger.error(f"Error fetching paged gameweeks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
+
+
+
 @app.get("/api/v1/optimize-team")
 def get_optimized_team(
     locked: Optional[List[str]] = Query(
@@ -666,5 +679,200 @@ def get_optimized_team(
     except Exception as e:
         logger.error(f"Error in optimizer endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+    
+
+@app.get("/api/v1/optimize-team/explain")
+def explain_optimized_team(
+    locked: Optional[List[str]] = Query(
+        None,
+        description=(
+            "Full names of players that must be in the 15-man squad, "
+            "same as /optimize-team. Frontend sends locked[]=Name1&locked[]=Name2."
+        ),
+        alias="locked[]"
+    )
+):
+    """
+    Use Gemini to explain the optimized squad:
+    - Overall strategy
+    - Key picks vs close alternatives
+    - Possible tweaks.
+
+    Returns: { "explanation": "<markdown / text>" }
+    """
+    logger.info("'/api/v1/optimize-team/explain' endpoint accessed.")
+    logger.info(f"Params: locked={locked}")
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY not set on server. LLM explanations are disabled."
+        )
+
+    try:
+        # 1) Rebuild the optimized squad using the same logic as /optimize-team
+        logger.info("Loading player data from CSV for explanation...")
+        predictor.load_data()
+        df = predictor.predict_all_players()
+        optimizer_data = predictor.get_optimizer_format()
+
+        logger.info("Running optimizer for explanation...")
+        squad_ids, xi_ids, captain_id = pick_fpl_team_with_predictions(
+            optimizer_data,
+            locked_names=locked
+        )
+        if not squad_ids:
+            raise HTTPException(status_code=500, detail="Optimizer failed; cannot explain squad.")
+
+        # df rows are indexed by the internal "player_id" we used in get_optimizer_format
+        # build a small summary table for Gemini
+        pos_map = {'GK': 'Goalkeeper', 'DEF': 'Defender', 'MID': 'Midfielder', 'FWD': 'Forward'}
+
+        squad_rows = []
+        for internal_id in squad_ids:
+            row = df.iloc[int(internal_id)]
+            pos_str = row.get("pos_std", row.get("position", "MID"))
+            full_name = str(row.get("name", "Unknown"))
+            team_name = str(row.get("team", row.get("team_name", "Unknown")))
+            predicted = float(row.get("predicted_points", 0.0))
+
+            # cost in £ (your optimizer used cost_gbp; here we infer from now_cost/value)
+            if "now_cost" in df.columns:
+                cost_gbp = float(row["now_cost"]) / 10.0
+            elif "value" in df.columns:
+                cost_gbp = float(row["value"]) / 10.0
+            else:
+                cost_gbp = 0.0
+
+            value_per_m = predicted / cost_gbp if cost_gbp > 0 else 0.0
+
+            squad_rows.append({
+                "name": full_name,
+                "team": team_name,
+                "position": pos_map.get(pos_str, pos_str),
+                "predicted_points": predicted,
+                "cost_gbp": cost_gbp,
+                "value_per_m": value_per_m,
+                "is_captain": (captain_id is not None and int(internal_id) == int(captain_id)),
+                "in_starting_xi": (int(internal_id) in xi_ids),
+            })
+
+        # find a few "near miss" alternatives by position: top predicted players not in squad
+        squad_internal_set = {int(i) for i in squad_ids}
+        candidates = []
+        for idx, row in df.iterrows():
+            if int(idx) in squad_internal_set:
+                continue
+            pos_str = row.get("pos_std", row.get("position", "MID"))
+            full_name = str(row.get("name", "Unknown"))
+            team_name = str(row.get("team", row.get("team_name", "Unknown")))
+            predicted = float(row.get("predicted_points", 0.0))
+            if "now_cost" in df.columns:
+                cost_gbp = float(row["now_cost"]) / 10.0
+            elif "value" in df.columns:
+                cost_gbp = float(row["value"]) / 10.0
+            else:
+                cost_gbp = 0.0
+            value_per_m = predicted / cost_gbp if cost_gbp > 0 else 0.0
+
+            candidates.append({
+                "name": full_name,
+                "team": team_name,
+                "position": pos_map.get(pos_str, pos_str),
+                "predicted_points": predicted,
+                "cost_gbp": cost_gbp,
+                "value_per_m": value_per_m,
+            })
+
+        # keep only a few best alternatives per position to avoid overloading the prompt
+        alt_by_position = {}
+        for c in candidates:
+            pos = c["position"]
+            alt_by_position.setdefault(pos, []).append(c)
+        for pos in alt_by_position:
+            alt_by_position[pos].sort(key=lambda x: x["predicted_points"], reverse=True)
+            alt_by_position[pos] = alt_by_position[pos][:3]
+
+        # 2) Build prompt for Gemini
+        def fmt_player(p):
+            flags = []
+            if p["is_captain"]:
+                flags.append("CAPTAIN")
+            if p["in_starting_xi"]:
+                flags.append("XI")
+            flag_str = f" [{' / '.join(flags)}]" if flags else ""
+            return (
+                f"- {p['name']} ({p['team']}, {p['position']}){flag_str}: "
+                f"{p['predicted_points']:.1f} pts, £{p['cost_gbp']:.1f}m, "
+                f"{p['value_per_m']:.2f} pts per £m"
+            )
+
+        squad_text = "\n".join(fmt_player(p) for p in squad_rows)
+
+        alt_lines = []
+        for pos, lst in alt_by_position.items():
+            if not lst:
+                continue
+            alt_lines.append(f"{pos}:")
+            for p in lst:
+                alt_lines.append(
+                    f"  - {p['name']} ({p['team']}): "
+                    f"{p['predicted_points']:.1f} pts, £{p['cost_gbp']:.1f}m, "
+                    f"{p['value_per_m']:.2f} pts per £m"
+                )
+        alternatives_text = "\n".join(alt_lines) if alt_lines else "None."
+
+        locked_text = ", ".join(locked) if locked else "None."
+
+        prompt = f"""
+You are an assistant helping a Fantasy Premier League manager understand an optimized squad
+chosen by a mathematical optimizer (with predicted points and FPL constraints like budget and
+position quotas).
+
+The user may have locked in some players: {locked_text}.
+
+Here is the chosen 15-man squad with predicted points and costs:
+
+{squad_text}
+
+Here are a few strong alternative options by position that the optimizer did NOT choose:
+
+{alternatives_text}
+
+Please write a concise explanation in three sections:
+
+1. Overall strategy (1–2 short paragraphs)
+   - Describe the balance between premiums, mid-priced, and budget players.
+   - Mention noticeable stacks (e.g., multiple players from the same team or position).
+
+2. Key picks and why they beat alternatives (bullet points)
+   - Pick ~5 of the most important players (including captain).
+   - For each: explain why they are valuable in terms of predicted points, cost, and role.
+   - When relevant, compare briefly to one alternative in the same position.
+
+3. Possible tweaks (3–4 bullet points)
+   - Suggest a few swaps the user could consider (for upside, safety, or team balance),
+     using only the players listed above.
+   - Be concrete: “Swap X for Y if you want more upside in midfield,” etc.
+
+Keep the tone friendly and fairly compact. You do NOT need to explain basic FPL rules.
+Use markdown (headings + bullet lists) so the frontend can render it nicely.
+"""
+
+        # 3) Call Gemini
+        logger.info("Calling Gemini to generate explanation...")
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        result = model.generate_content(prompt)
+        text = result.text if hasattr(result, "text") else str(result)
+
+        return {"explanation": text}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in explanation endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+
 
 

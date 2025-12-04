@@ -33,6 +33,8 @@ export const getPlayers = async (): Promise<Player[]> => {
   }
 };
 
+// --- UPDATED FUNCTION ---
+// Function to fetch the optimized 15-player squad
 export const getOptimizedTeam = async (
   lockedNames?: string[]
 ): Promise<OptimizedTeamResponse> => {
@@ -54,6 +56,32 @@ export const getOptimizedTeam = async (
   }
 };
 
+export interface TeamExplanationResponse {
+  explanation: string;
+}
+
+export const getOptimizedTeamExplanation = async (
+  lockedNames?: string[]
+): Promise<TeamExplanationResponse> => {
+  try {
+    const params: any = {};
+    if (lockedNames && lockedNames.length > 0) {
+      params.locked = lockedNames; // -> locked[]=...
+    }
+
+    const response = await axios.get<TeamExplanationResponse>(
+      `${API_URL}/api/v1/optimize-team/explain`,
+      { params }
+    );
+    return response.data;
+  } catch (error) {
+    console.error(
+      `Error fetching team explanation from ${API_URL}/api/v1/optimize-team/explain:`,
+      error
+    );
+    throw error;
+  }
+};
 
 // --- All other functions (getPlayersPaged, getTeams, etc.) remain below ---
 
