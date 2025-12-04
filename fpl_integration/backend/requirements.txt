@@ -24,3 +24,5 @@ ortools==9.8.3296
 statsmodels==0.14.1
 seaborn==0.13.0
 matplotlib==3.8.2
+
+google-generativeai==0.8.3
