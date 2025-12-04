@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 import logging
 import pandas as pd
+from typing import List, Optional
+from fastapi import Query, HTTPException
 
 # ========== NEW IMPORTS FOR INTEGRATION ==========
 from predictor import FPLPredictor
@@ -549,52 +551,67 @@ def get_gameweeks_paged(
         logger.error(f"Error fetching paged gameweeks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
-
-# ========== COMPLETELY REWRITTEN OPTIMIZE ENDPOINT ==========
 @app.get("/api/v1/optimize-team")
-def get_optimized_team():
+def get_optimized_team(
+    locked: Optional[List[str]] = Query(
+        None,
+        description=(
+            "Full names of players that must be in the 15-man squad. "
+            "Frontend will send locked[]=Name1&locked[]=Name2"
+        ),
+        alias="locked[]"  # IMPORTANT: match axios `locked[]=...`
+    )
+):
     """
     Fetch optimized 15-player squad using ML predictions + OR-Tools optimizer.
+
+    Query params:
+      - locked[] (optional, repeated): full names that MUST be in the squad, e.g.
+          /api/v1/optimize-team?locked[]=Erling%20Haaland&locked[]=Bukayo%20Saka
+
     Returns squad in format expected by frontend.
     Works WITHOUT database - uses CSV file only.
     """
     logger.info("'/api/v1/optimize-team' endpoint accessed.")
-    
+    logger.info(f"Params: locked={locked}")
+
     try:
         # Step 1: Load CSV data
         logger.info("Loading player data from CSV...")
         predictor.load_data()
-        
+
+        # NO GAMEWEEK FILTER ANYMORE
+
         # Step 2: Generate ML predictions for all players
         logger.info("Generating ML predictions...")
         df = predictor.predict_all_players()
-        
-        # Step 3: Format data for optimizer
+
+        # Step 3: Format data for optimizer (per-player rows)
         logger.info("Preparing data for optimizer...")
         optimizer_data = predictor.get_optimizer_format()
-        
-        # Step 4: Run optimizer
+
+        # Step 4: Run optimizer with optional locked names
         logger.info("Running optimizer...")
-        squad_ids, xi_ids, captain_id = pick_fpl_team_with_predictions(optimizer_data)
-        
+        squad_ids, xi_ids, captain_id = pick_fpl_team_with_predictions(
+            optimizer_data,
+            locked_names=locked
+        )
+
         if not squad_ids:
             raise HTTPException(status_code=500, detail="Optimizer failed to find a solution.")
-        
-        # Step 5: Transform CSV format to Frontend format
+
+        # Step 5: Transform data for frontend
         logger.info("Transforming data for frontend...")
-        
-        # Position mapping: string to number
+
         pos_to_num = {'GK': 1, 'DEF': 2, 'MID': 3, 'FWD': 4}
-        
-        # Get full player details from dataframe
         squad_players = []
-        for idx in squad_ids:
-            row = df.iloc[idx]
-            
-            # Extract name components
+
+        for internal_id in squad_ids:
+            row = df.iloc[int(internal_id)]
+
+            # Names
             if 'name' in df.columns:
                 full_name = str(row['name'])
-                # Try to split into first/last
                 name_parts = full_name.split(' ', 1)
                 first_name = name_parts[0] if len(name_parts) > 0 else None
                 second_name = name_parts[1] if len(name_parts) > 1 else None
@@ -603,48 +620,51 @@ def get_optimized_team():
                 first_name = row.get('first_name')
                 second_name = row.get('second_name')
                 web_name = f"{first_name} {second_name}".strip() if first_name or second_name else "Unknown"
-            
-            # Get position as number
+
+            # Position
             pos_str = row.get('pos_std', row.get('position', 'MID'))
             position_num = pos_to_num.get(pos_str, 3)
-            
-            # Get cost in tenths (frontend expects now_cost in tenths, e.g., 55 = £5.5m)
+
+            # Cost in tenths (now_cost already tenths in your CSV)
             if 'now_cost' in df.columns:
-                cost_tenths = int(row['now_cost'] * 10)
+                cost_tenths = int(row['now_cost'])
             elif 'value' in df.columns:
-                cost_tenths = int(row['value'] * 10)
+                cost_tenths = int(row['value'])
             else:
                 cost_tenths = 0
-            
-            # Get team_id (use team name as ID if no numeric team_id)
+
+            # Team id
             team_id = row.get('team_id', 0)
-            if team_id == 0 and 'team' in df.columns:
-                # Use hash of team name as a pseudo-ID
+            if (team_id == 0 or pd.isna(team_id)) and 'team' in df.columns:
                 team_id = hash(str(row['team'])) % 100
-            
+
             player_dict = {
-                'id': int(idx),
+                'id': int(internal_id),
                 'first_name': first_name,
                 'second_name': second_name,
                 'web_name': web_name,
                 'team_id': int(team_id),
                 'position': position_num,
-                'now_cost': cost_tenths
+                'now_cost': int(cost_tenths),
             }
             squad_players.append(player_dict)
-        
-        # Step 6: Return in format expected by frontend
+
         response = {
             'squad': squad_players,
-            'xi_ids': [int(idx) for idx in xi_ids],
+            'xi_ids': [int(pid) for pid in xi_ids],
             'captain_id': int(captain_id) if captain_id is not None else None
         }
-        
-        logger.info(f"✓ Successfully optimized team: {len(squad_players)} players, XI: {len(xi_ids)}, Captain: {captain_id}")
+
+        logger.info(
+            f"✓ Successfully optimized team: "
+            f"{len(squad_players)} players, XI: {len(xi_ids)}, Captain: {captain_id}"
+        )
         return response
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in optimizer endpoint: {e}", exc_info=True)
-
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
 
