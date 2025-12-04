@@ -1,0 +1,29 @@
+# FPL Predictor Backend - Python Dependencies
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9  # PostgreSQL adapter for Neon database
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Machine Learning
+xgboost==2.0.3
+scikit-learn==1.3.2
+pandas==2.1.3
+numpy==1.26.2
+
+# Optimization
+ortools==9.8.3296
+
+# Data Analysis (for correlation script)
+statsmodels==0.14.1
+seaborn==0.13.0
+matplotlib==3.8.2
+
+# Utilities
+pickle5==0.0.11  # For model serialization (Python < 3.8)
