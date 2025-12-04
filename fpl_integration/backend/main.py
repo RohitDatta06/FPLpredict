@@ -64,7 +64,7 @@ app = FastAPI(
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # Add Vercel deployment URL here later 
+    https://fpl-team-generator.onrender.com
 ]
 
 app.add_middleware(
@@ -645,4 +645,5 @@ def get_optimized_team():
         
     except Exception as e:
         logger.error(f"Error in optimizer endpoint: {e}", exc_info=True)
+
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
