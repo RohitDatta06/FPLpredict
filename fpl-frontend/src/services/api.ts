@@ -33,12 +33,20 @@ export const getPlayers = async (): Promise<Player[]> => {
   }
 };
 
-// --- UPDATED FUNCTION ---
-// Function to fetch the optimized 15-player squad
-export const getOptimizedTeam = async (): Promise<OptimizedTeamResponse> => {
+export const getOptimizedTeam = async (
+  lockedNames?: string[]
+): Promise<OptimizedTeamResponse> => {
   try {
-    // We update the expected type from Player[] to OptimizedTeamResponse
-    const response = await axios.get<OptimizedTeamResponse>(`${API_URL}/api/v1/optimize-team`);
+    const params: any = {};
+    if (lockedNames && lockedNames.length > 0) {
+      // axios will serialize this as locked[]=A&locked[]=B
+      params.locked = lockedNames;
+    }
+
+    const response = await axios.get<OptimizedTeamResponse>(
+      `${API_URL}/api/v1/optimize-team`,
+      { params }
+    );
     return response.data;
   } catch (error) {
     console.error(`Error fetching optimized team from ${API_URL}/api/v1/optimize-team:`, error);
